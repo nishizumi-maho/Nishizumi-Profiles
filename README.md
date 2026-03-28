@@ -50,7 +50,7 @@ For most users:
 
 ## Basic daily usage
 
-- Launch Nishizumi_Profiles before or while using iRacing.
+- Launch Nishizumi_Profiles before or while using iRacing (start with your system is best!)
 - Select renderer/grouping at top.
 - The app monitors sim sessions and updates/applies profiles when needed.
 - Use **Refresh list** to see latest saved combos.
