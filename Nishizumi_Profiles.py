@@ -332,6 +332,9 @@ class ProfileManager:
         renderer_file = renderer_file or self.get_selected_renderer()
         return self.iracing_docs / renderer_file
 
+    def get_active_app_ini(self) -> Path:
+        return self.iracing_docs / "app.ini"
+
     def renderer_stem(self, renderer_file: str | None = None) -> str:
         renderer_file = renderer_file or self.get_selected_renderer()
         return Path(renderer_file).stem
@@ -352,6 +355,35 @@ class ProfileManager:
     def get_global_backup_path(self, renderer_file: str | None = None) -> Path:
         renderer_file = renderer_file or self.get_selected_renderer()
         return self.profile_root / f"{self.renderer_stem(renderer_file)}.global_backup.ini"
+
+    def get_app_ini_dir(self) -> Path:
+        path = self.profile_root / "app_ini_by_car"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def get_app_ini_profile_path(self, combo: ComboInfo) -> Path:
+        combo = combo.normalized()
+        return self.get_app_ini_dir() / f"car_{combo.car_key()}__app.ini"
+
+    def get_app_ini_meta_path(self, combo: ComboInfo) -> Path:
+        combo = combo.normalized()
+        return self.get_app_ini_dir() / f"car_{combo.car_key()}__app.json"
+
+    def write_app_ini_meta(self, combo: ComboInfo, app_ini_path: Path) -> None:
+        combo = combo.normalized()
+        meta = {
+            "car_key": combo.car_key(),
+            "car_path": combo.car_path,
+            "car_screen": combo.car_screen,
+            "car_short": combo.car_short,
+            "profile_app_ini": str(app_ini_path),
+            "saved_at": now_str(),
+            "sha1": file_sha1(app_ini_path),
+        }
+        self.get_app_ini_meta_path(combo).write_text(
+            json.dumps(meta, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
 
     def ensure_renderer_section(self, renderer_file: str) -> None:
         with self.lock:
@@ -547,6 +579,27 @@ class ProfileManager:
         entry["last_saved_at"] = now_str()
         self.save_manifest()
         return entry
+
+    def save_active_app_ini_for_car(self, combo: ComboInfo) -> Path:
+        combo = combo.normalized()
+        active_app_ini = self.get_active_app_ini()
+        if not active_app_ini.exists():
+            raise FileNotFoundError(f"Active file not found: {active_app_ini}")
+        app_ini_path = self.get_app_ini_profile_path(combo)
+        shutil.copy2(active_app_ini, app_ini_path)
+        self.write_app_ini_meta(combo, app_ini_path)
+        return app_ini_path
+
+    def apply_app_ini_profile_for_car(self, combo: ComboInfo) -> Path:
+        combo = combo.normalized()
+        app_ini_path = self.get_app_ini_profile_path(combo)
+        active_app_ini = self.get_active_app_ini()
+        if not app_ini_path.exists():
+            raise FileNotFoundError(f"App profile not found: {app_ini_path}")
+        if not active_app_ini.exists():
+            raise FileNotFoundError(f"Active file not found: {active_app_ini}")
+        shutil.copy2(app_ini_path, active_app_ini)
+        return app_ini_path
 
     def apply_profile_to_active_ini(self, combo_key: str, renderer_file: str | None = None, grouping_mode: str | None = None) -> dict[str, Any]:
         renderer_file = renderer_file or self.get_selected_renderer()
@@ -884,6 +937,7 @@ class MonitorService:
                     session_grouping = str(self.session.get("grouping_mode") or grouping_mode)
                     session_combo_key = str(self.session.get("combo_key"))
                     session_active_ini = self.manager.get_active_ini(session_renderer)
+                    session_active_app_ini = self.manager.get_active_app_ini()
 
                     self.log(f"Waiting for {session_active_ini.name} to stabilize...")
                     stable = wait_for_file_stable(
@@ -897,12 +951,33 @@ class MonitorService:
                     else:
                         self.log("File stabilized")
 
+                    if session_active_app_ini.exists():
+                        self.log(f"Waiting for {session_active_app_ini.name} to stabilize...")
+                        app_stable = wait_for_file_stable(
+                            session_active_app_ini,
+                            stable_seconds=FILE_STABLE_SECONDS,
+                            timeout=POST_CLOSE_SETTLE_TIMEOUT,
+                        )
+                        if not app_stable:
+                            self.log("Warning: app.ini did not stabilize within the expected time")
+                        else:
+                            self.log("app.ini stabilized")
+                    else:
+                        self.log("app.ini was not found; app.ini profile actions will be skipped")
+
                     if bool(self.session.get("profile_apply_pending")):
                         try:
                             self.manager.apply_profile_to_active_ini(session_combo_key, session_renderer, session_grouping)
                             self.log("Correct profile applied to the active INI. Reopen the sim manually whenever you want")
                         except Exception as e:
                             self.log(f"Error applying known profile: {e}")
+                        try:
+                            app_path = self.manager.apply_app_ini_profile_for_car(combo)
+                            self.log(f"Per-car app.ini applied: {app_path.name}")
+                        except FileNotFoundError:
+                            self.log("No saved per-car app.ini found yet; skipping app.ini apply")
+                        except Exception as e:
+                            self.log(f"Error applying per-car app.ini: {e}")
                     else:
                         entry = self.manager.get_entry(session_combo_key, session_renderer, session_grouping)
                         autosave = True if entry is None else bool(entry.get("autosave_on_manual_close", True))
@@ -912,6 +987,13 @@ class MonitorService:
                                 self.log("Manual close detected, profile saved/updated")
                             except Exception as e:
                                 self.log(f"Error saving profile on manual close: {e}")
+                            try:
+                                app_path = self.manager.save_active_app_ini_for_car(combo)
+                                self.log(f"Per-car app.ini saved/updated: {app_path.name}")
+                            except FileNotFoundError:
+                                self.log("app.ini was not found; per-car app.ini was not saved")
+                            except Exception as e:
+                                self.log(f"Error saving per-car app.ini: {e}")
                         else:
                             self.log("Autosave is disabled for this combo; the profile was not updated")
 
