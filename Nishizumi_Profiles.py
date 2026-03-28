@@ -72,6 +72,8 @@ PRE_CLOSE_DELAY = 5.0
 POST_CLOSE_SETTLE_TIMEOUT = 25.0
 FILE_STABLE_SECONDS = 2.0
 LOG_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
+APP_NAME = "Nishizumi_Profiles"
+APP_VERSION = "1.0.0"
 
 
 # ============================================================
@@ -930,7 +932,7 @@ class MonitorService:
 class FirstRunDialog(QDialog):
     def __init__(self, parent: QWidget | None, default_renderer_label: str, default_grouping_label: str) -> None:
         super().__init__(parent)
-        self.setWindowTitle("First-time setup")
+        self.setWindowTitle(f"{APP_NAME} - First-time setup")
         self.setModal(True)
 
         layout = QVBoxLayout(self)
@@ -972,7 +974,7 @@ class FirstRunDialog(QDialog):
 class App(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("iRacing Renderer Combo Profile Manager")
+        self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
         self.resize(1280, 830)
         self.setMinimumSize(1160, 720)
 
@@ -1645,6 +1647,8 @@ class App(QMainWindow):
 
 def main() -> int:
     app = QApplication([])
+    app.setApplicationName(APP_NAME)
+    app.setApplicationDisplayName(f"{APP_NAME} v{APP_VERSION}")
     window = App()
     window.show()
     return app.exec()
