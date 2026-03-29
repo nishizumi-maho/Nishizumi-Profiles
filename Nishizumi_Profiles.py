@@ -332,6 +332,9 @@ class ProfileManager:
         renderer_file = renderer_file or self.get_selected_renderer()
         return self.iracing_docs / renderer_file
 
+    def get_active_app_ini(self) -> Path:
+        return self.iracing_docs / "app.ini"
+
     def renderer_stem(self, renderer_file: str | None = None) -> str:
         renderer_file = renderer_file or self.get_selected_renderer()
         return Path(renderer_file).stem
@@ -416,12 +419,17 @@ class ProfileManager:
         grouping_mode = grouping_mode or self.get_selected_grouping()
         return self.get_grouping_dir(renderer_file, grouping_mode) / f"{combo.base_filename(grouping_mode, self.renderer_stem(renderer_file))}.ini"
 
+    def get_profile_app_ini_path(self, combo: ComboInfo, renderer_file: str | None = None, grouping_mode: str | None = None) -> Path:
+        renderer_file = renderer_file or self.get_selected_renderer()
+        grouping_mode = grouping_mode or self.get_selected_grouping()
+        return self.get_grouping_dir(renderer_file, grouping_mode) / f"{combo.base_filename(grouping_mode, self.renderer_stem(renderer_file))}__app.ini"
+
     def get_profile_meta_path(self, combo: ComboInfo, renderer_file: str | None = None, grouping_mode: str | None = None) -> Path:
         renderer_file = renderer_file or self.get_selected_renderer()
         grouping_mode = grouping_mode or self.get_selected_grouping()
         return self.get_grouping_dir(renderer_file, grouping_mode) / f"{combo.base_filename(grouping_mode, self.renderer_stem(renderer_file))}.json"
 
-    def write_profile_meta(self, combo: ComboInfo, ini_path: Path, renderer_file: str, grouping_mode: str) -> None:
+    def write_profile_meta(self, combo: ComboInfo, ini_path: Path, app_ini_path: Path, renderer_file: str, grouping_mode: str) -> None:
         meta = {
             "renderer_file": renderer_file,
             "grouping_mode": grouping_mode,
@@ -435,8 +443,10 @@ class ProfileManager:
             "car_short": combo.car_short,
             "series_id": combo.series_id,
             "profile_ini": str(ini_path),
+            "profile_app_ini": str(app_ini_path),
             "saved_at": now_str(),
             "sha1": file_sha1(ini_path),
+            "app_sha1": file_sha1(app_ini_path),
         }
         self.get_profile_meta_path(combo, renderer_file, grouping_mode).write_text(
             json.dumps(meta, indent=2, ensure_ascii=False),
@@ -474,6 +484,7 @@ class ProfileManager:
             combos = section.setdefault("combos", {})
             existing = combos.get(combo_key)
             ini_path = self.get_profile_ini_path(combo, renderer_file, grouping_mode)
+            app_ini_path = self.get_profile_app_ini_path(combo, renderer_file, grouping_mode)
             meta_path = self.get_profile_meta_path(combo, renderer_file, grouping_mode)
 
             if existing is None:
@@ -490,8 +501,10 @@ class ProfileManager:
                     "car_short": combo.car_short,
                     "series_id": combo.series_id,
                     "profile_ini": str(ini_path),
+                    "profile_app_ini": str(app_ini_path),
                     "profile_meta": str(meta_path),
                     "profile_sha1": file_sha1(ini_path) if ini_path.exists() else None,
+                    "profile_app_sha1": file_sha1(app_ini_path) if app_ini_path.exists() else None,
                     "enabled": True,
                     "autosave_on_manual_close": True,
                     "last_used_at": now_str(),
@@ -512,6 +525,7 @@ class ProfileManager:
                     "car_short": combo.car_short,
                     "series_id": combo.series_id,
                     "profile_ini": str(ini_path),
+                    "profile_app_ini": str(app_ini_path),
                     "profile_meta": str(meta_path),
                     "last_used_at": now_str(),
                 })
@@ -534,16 +548,22 @@ class ProfileManager:
         grouping_mode = grouping_mode or self.get_selected_grouping()
         combo = combo.normalized()
         active_ini = self.get_active_ini(renderer_file)
+        active_app_ini = self.get_active_app_ini()
 
         if not active_ini.exists():
             raise FileNotFoundError(f"Active file not found: {active_ini}")
+        if not active_app_ini.exists():
+            raise FileNotFoundError(f"Active file not found: {active_app_ini}")
 
         entry = self.register_combo(combo, renderer_file, grouping_mode)
         ini_path = self.get_profile_ini_path(combo, renderer_file, grouping_mode)
+        app_ini_path = self.get_profile_app_ini_path(combo, renderer_file, grouping_mode)
         shutil.copy2(active_ini, ini_path)
-        self.write_profile_meta(combo, ini_path, renderer_file, grouping_mode)
+        shutil.copy2(active_app_ini, app_ini_path)
+        self.write_profile_meta(combo, ini_path, app_ini_path, renderer_file, grouping_mode)
 
         entry["profile_sha1"] = file_sha1(ini_path)
+        entry["profile_app_sha1"] = file_sha1(app_ini_path)
         entry["last_saved_at"] = now_str()
         self.save_manifest()
         return entry
@@ -556,7 +576,9 @@ class ProfileManager:
             raise KeyError(f"Combo not found: {combo_key}")
 
         ini_path = Path(str(entry.get("profile_ini") or ""))
+        app_ini_path = Path(str(entry.get("profile_app_ini") or ""))
         active_ini = self.get_active_ini(renderer_file)
+        active_app_ini = self.get_active_app_ini()
 
         if not ini_path.exists():
             raise FileNotFoundError(f"Profile not found: {ini_path}")
@@ -564,6 +586,10 @@ class ProfileManager:
             raise FileNotFoundError(f"Active file not found: {active_ini}")
 
         shutil.copy2(ini_path, active_ini)
+        if app_ini_path.exists():
+            if not active_app_ini.exists():
+                raise FileNotFoundError(f"Active file not found: {active_app_ini}")
+            shutil.copy2(app_ini_path, active_app_ini)
         entry["last_used_at"] = now_str()
         self.save_manifest()
         return entry
@@ -575,10 +601,18 @@ class ProfileManager:
         if not entry:
             return False
         ini_path = Path(str(entry.get("profile_ini") or ""))
+        app_ini_path = Path(str(entry.get("profile_app_ini") or ""))
         active_ini = self.get_active_ini(renderer_file)
+        active_app_ini = self.get_active_app_ini()
         if not ini_path.exists() or not active_ini.exists():
             return False
-        return files_equal(ini_path, active_ini)
+        if not files_equal(ini_path, active_ini):
+            return False
+        if app_ini_path.exists():
+            if not active_app_ini.exists():
+                return False
+            return files_equal(app_ini_path, active_app_ini)
+        return True
 
     def get_suggestions(self, renderer_file: str | None = None, grouping_mode: str | None = None) -> dict[str, list[str]]:
         renderer_file = renderer_file or self.get_selected_renderer()
@@ -625,8 +659,9 @@ class ProfileManager:
                 return False
 
             ini_path = Path(str(entry.get("profile_ini") or ""))
+            app_ini_path = Path(str(entry.get("profile_app_ini") or ""))
             meta_path = Path(str(entry.get("profile_meta") or ""))
-            for path in (ini_path, meta_path):
+            for path in (ini_path, app_ini_path, meta_path):
                 if path and path.exists():
                     try:
                         path.unlink()
@@ -646,8 +681,9 @@ class ProfileManager:
                     combos = grouping_section.setdefault("combos", {})
                     for entry in list(combos.values()):
                         ini_path = Path(str(entry.get("profile_ini") or ""))
+                        app_ini_path = Path(str(entry.get("profile_app_ini") or ""))
                         meta_path = Path(str(entry.get("profile_meta") or ""))
-                        for path in (ini_path, meta_path):
+                        for path in (ini_path, app_ini_path, meta_path):
                             if path and path.exists():
                                 try:
                                     path.unlink()
