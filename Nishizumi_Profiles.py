@@ -601,6 +601,18 @@ class ProfileManager:
         shutil.copy2(app_ini_path, active_app_ini)
         return app_ini_path
 
+    def has_app_ini_profile_for_car(self, combo: ComboInfo) -> bool:
+        combo = combo.normalized()
+        return self.get_app_ini_profile_path(combo).exists()
+
+    def active_app_ini_matches_car_profile(self, combo: ComboInfo) -> bool:
+        combo = combo.normalized()
+        app_ini_path = self.get_app_ini_profile_path(combo)
+        active_app_ini = self.get_active_app_ini()
+        if not app_ini_path.exists() or not active_app_ini.exists():
+            return False
+        return files_equal(app_ini_path, active_app_ini)
+
     def apply_profile_to_active_ini(self, combo_key: str, renderer_file: str | None = None, grouping_mode: str | None = None) -> dict[str, Any]:
         renderer_file = renderer_file or self.get_selected_renderer()
         grouping_mode = grouping_mode or self.get_selected_grouping()
@@ -903,12 +915,22 @@ class MonitorService:
                         enabled = bool(entry.get("enabled", True))
 
                         if profile_exists and enabled:
-                            if self.manager.active_ini_matches_profile(combo_key, renderer_file, grouping_mode):
+                            renderer_matches = self.manager.active_ini_matches_profile(combo_key, renderer_file, grouping_mode)
+                            has_app_profile = self.manager.has_app_ini_profile_for_car(combo)
+                            app_matches = self.manager.active_app_ini_matches_car_profile(combo) if has_app_profile else True
+
+                            if renderer_matches and app_matches:
                                 self.log("Known profile is already active")
                             else:
                                 self.session["close_scheduled_at"] = time.time() + PRE_CLOSE_DELAY
+                                mismatch_reasons: list[str] = []
+                                if not renderer_matches:
+                                    mismatch_reasons.append(active_ini.name)
+                                if not app_matches:
+                                    mismatch_reasons.append("app.ini")
+                                mismatch_text = " + ".join(mismatch_reasons) if mismatch_reasons else active_ini.name
                                 self.log(
-                                    f"Known profile is different from the active file ({active_ini.name}). "
+                                    f"Known profile is different from the active file ({mismatch_text}). "
                                     f"WM_CLOSE scheduled for {PRE_CLOSE_DELAY:.0f}s"
                                 )
                         else:
