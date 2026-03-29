@@ -1528,6 +1528,14 @@ class App(QMainWindow):
 
         try:
             entry = self.manager.save_active_ini_as_profile(combo, self.current_renderer_file(), self.current_grouping_mode())
+            app_saved = False
+            try:
+                self.manager.save_active_app_ini_for_car(combo)
+                app_saved = True
+            except FileNotFoundError:
+                self.log("app.ini was not found; per-car app.ini was not saved")
+            except Exception as e:
+                self.log(f"Error saving per-car app.ini: {e}")
             combo_key = combo.combo_key(self.current_grouping_mode())
             self.manager.update_entry_options(
                 combo_key,
@@ -1538,7 +1546,8 @@ class App(QMainWindow):
             )
             self.selected_combo_key = combo_key
             self.refresh_all()
-            self.set_status(f"Profile saved: {Path(str(entry['profile_ini'])).name}")
+            app_suffix = " + app.ini" if app_saved else ""
+            self.set_status(f"Profile saved: {Path(str(entry['profile_ini'])).name}{app_suffix}")
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
 
@@ -1551,13 +1560,41 @@ class App(QMainWindow):
         runtime = IRacingRuntime()
         try:
             if runtime.is_sim_running():
-                QMessageBox.warning(
-                    self,
-                    "Sim open",
-                    "Close the sim before manually applying a profile to the active INI.\n"
-                    "The automatic monitor already handles this when it detects a mismatch.",
+                sent = runtime.post_wm_close_to_sim_windows()
+                if sent <= 0:
+                    QMessageBox.warning(
+                        self,
+                        "Sim open",
+                        "The sim is running, but no window was found for WM_CLOSE.\n"
+                        "Close the sim manually, then apply the profile again.",
+                    )
+                    return
+
+                close_start = time.time()
+                while runtime.is_sim_running() and time.time() - close_start < POST_CLOSE_SETTLE_TIMEOUT:
+                    time.sleep(0.25)
+
+                if runtime.is_sim_running():
+                    QMessageBox.warning(
+                        self,
+                        "Sim still running",
+                        "The sim did not close in time. Please close it manually and try again.",
+                    )
+                    return
+
+                session_active_ini = self.manager.get_active_ini(self.current_renderer_file())
+                wait_for_file_stable(
+                    session_active_ini,
+                    stable_seconds=FILE_STABLE_SECONDS,
+                    timeout=POST_CLOSE_SETTLE_TIMEOUT,
                 )
-                return
+                session_active_app_ini = self.manager.get_active_app_ini()
+                if session_active_app_ini.exists():
+                    wait_for_file_stable(
+                        session_active_app_ini,
+                        stable_seconds=FILE_STABLE_SECONDS,
+                        timeout=POST_CLOSE_SETTLE_TIMEOUT,
+                    )
         finally:
             runtime.reset()
 
@@ -1567,7 +1604,14 @@ class App(QMainWindow):
                 self.current_renderer_file(),
                 self.current_grouping_mode(),
             )
-            self.set_status(f"Profile manually applied to the active INI ({self.current_renderer_file()})")
+            try:
+                self.manager.apply_app_ini_profile_for_car(combo)
+                self.set_status(f"Profile + per-car app.ini applied ({self.current_renderer_file()})")
+            except FileNotFoundError:
+                self.set_status(f"Profile applied ({self.current_renderer_file()}); no per-car app.ini saved for this car yet")
+            except Exception as e:
+                self.log(f"Error applying per-car app.ini: {e}")
+                self.set_status(f"Profile applied ({self.current_renderer_file()}); app.ini apply failed")
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
 
