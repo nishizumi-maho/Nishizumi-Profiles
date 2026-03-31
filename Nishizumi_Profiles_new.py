@@ -4,12 +4,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import re
 import shutil
 import threading
 import time
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -76,10 +73,7 @@ POST_CLOSE_SETTLE_TIMEOUT = 25.0
 FILE_STABLE_SECONDS = 2.0
 LOG_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
 APP_NAME = "Nishizumi_Profiles"
-APP_VERSION = "4.0.0"
-GITHUB_RELEASES_API_URL = "https://api.github.com/repos/Rebdragon/Nishizumi-Profiles/releases"
-GITHUB_CHECK_TIMEOUT_SECONDS = 4
-MAX_SUPPORTED_MAJOR_VERSION = 4
+APP_VERSION = "1.0.0"
 PROFILE_PRIORITY_ORDER = ["car_track", "car", "track", "series_track", "series"]
 
 
@@ -158,46 +152,6 @@ def wait_for_file_stable(path: Path, stable_seconds: float, timeout: float) -> b
         time.sleep(0.25)
 
     return False
-
-
-def parse_major_version(version_text: str | None) -> int | None:
-    if not version_text:
-        return None
-    match = re.search(r"v?(\d+)", version_text.strip().lower())
-    if not match:
-        return None
-    try:
-        return int(match.group(1))
-    except ValueError:
-        return None
-
-
-def fetch_latest_release_tag() -> str | None:
-    request = urllib.request.Request(
-        GITHUB_RELEASES_API_URL,
-        headers={
-            "Accept": "application/vnd.github+json",
-            "User-Agent": f"{APP_NAME}/{APP_VERSION}",
-        },
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=GITHUB_CHECK_TIMEOUT_SECONDS) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError, OSError):
-        return None
-
-    if not isinstance(payload, list) or not payload:
-        return None
-
-    for release in payload:
-        if not isinstance(release, dict):
-            continue
-        if bool(release.get("draft")) or bool(release.get("prerelease")):
-            continue
-        tag = str(release.get("tag_name") or "").strip()
-        if tag:
-            return tag
-    return None
 
 
 # ============================================================
@@ -1201,7 +1155,6 @@ class App(QMainWindow):
 
         self._build_ui()
         self._run_first_time_setup_if_needed()
-        self._verify_supported_release_window()
 
         self.monitor = MonitorService(
             self.manager,
@@ -1217,37 +1170,6 @@ class App(QMainWindow):
         self.log_timer.setInterval(200)
         self.log_timer.timeout.connect(self._drain_log_queue)
         self.log_timer.start()
-
-    def _verify_supported_release_window(self) -> None:
-        latest_tag = fetch_latest_release_tag()
-        if not latest_tag:
-            self.enqueue_log(f"[{now_str()}] GitHub release verification skipped (could not fetch releases)")
-            return
-
-        latest_major = parse_major_version(latest_tag)
-        if latest_major is None:
-            self.enqueue_log(f"[{now_str()}] GitHub release verification skipped (invalid tag: {latest_tag})")
-            return
-
-        if latest_major > MAX_SUPPORTED_MAJOR_VERSION:
-            QMessageBox.warning(
-                self,
-                "Version verification warning",
-                "A newer major release was detected on GitHub.\n\n"
-                f"Latest release tag: {latest_tag}\n"
-                f"This build supports up to v{MAX_SUPPORTED_MAJOR_VERSION}.\n\n"
-                "Please download the latest app version.",
-            )
-            self.enqueue_log(
-                f"[{now_str()}] GitHub release verification warning: latest tag {latest_tag} "
-                f"(> v{MAX_SUPPORTED_MAJOR_VERSION})"
-            )
-            return
-
-        self.enqueue_log(
-            f"[{now_str()}] GitHub release verification passed: {latest_tag} "
-            f"(<= v{MAX_SUPPORTED_MAJOR_VERSION})"
-        )
 
     def _load_bootstrap_path(self) -> Path | None:
         if not BOOTSTRAP_SETTINGS_PATH.exists():
