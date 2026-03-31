@@ -74,6 +74,7 @@ FILE_STABLE_SECONDS = 2.0
 LOG_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
 APP_NAME = "Nishizumi_Profiles"
 APP_VERSION = "1.0.0"
+DEFAULT_GROUPING_PRIORITY = ["car_track", "car", "track", "series_track", "series"]
 
 
 # ============================================================
@@ -246,6 +247,7 @@ class ProfileManager:
         self.lock = threading.RLock()
         self.ensure_dirs()
         self.settings = self.load_settings()
+        self.ensure_default_settings()
         self.manifest = self.load_manifest()
 
         self.ensure_renderer_section(self.get_selected_renderer())
@@ -264,6 +266,26 @@ class ProfileManager:
             except Exception:
                 pass
         return {}
+
+    def ensure_default_settings(self) -> None:
+        changed = False
+        if self.settings.get("default_renderer") not in RENDERER_OPTIONS.values():
+            self.settings["default_renderer"] = "rendererDX11OpenXR.ini"
+            changed = True
+        if self.settings.get("default_grouping") not in GROUPING_OPTIONS.values():
+            self.settings["default_grouping"] = "car_track"
+            changed = True
+        if not isinstance(self.settings.get("grouping_priority"), list):
+            self.settings["grouping_priority"] = list(DEFAULT_GROUPING_PRIORITY)
+            changed = True
+        if "prompt_before_saving_new_combo" not in self.settings:
+            self.settings["prompt_before_saving_new_combo"] = True
+            changed = True
+        if "save_app_ini_globally" not in self.settings:
+            self.settings["save_app_ini_globally"] = True
+            changed = True
+        if changed:
+            self.save_settings()
 
     def save_settings(self) -> None:
         self.app_settings_path.write_text(
@@ -318,6 +340,34 @@ class ProfileManager:
         if selected not in GROUPING_OPTIONS.values():
             selected = "car_track"
         return selected
+
+    def get_grouping_priority(self) -> list[str]:
+        raw = self.settings.get("grouping_priority")
+        if not isinstance(raw, list):
+            return list(DEFAULT_GROUPING_PRIORITY)
+        cleaned: list[str] = []
+        for item in raw:
+            mode = str(item)
+            if mode in GROUPING_OPTIONS.values() and mode not in cleaned:
+                cleaned.append(mode)
+        for default_mode in DEFAULT_GROUPING_PRIORITY:
+            if default_mode not in cleaned:
+                cleaned.append(default_mode)
+        return cleaned
+
+    def get_prompt_before_saving_new_combo(self) -> bool:
+        return bool(self.settings.get("prompt_before_saving_new_combo", True))
+
+    def set_prompt_before_saving_new_combo(self, enabled: bool) -> None:
+        self.settings["prompt_before_saving_new_combo"] = bool(enabled)
+        self.save_settings()
+
+    def get_save_app_ini_globally(self) -> bool:
+        return bool(self.settings.get("save_app_ini_globally", True))
+
+    def set_save_app_ini_globally(self, enabled: bool) -> None:
+        self.settings["save_app_ini_globally"] = bool(enabled)
+        self.save_settings()
 
     def set_selected_grouping(self, grouping_mode: str) -> None:
         if grouping_mode not in GROUPING_OPTIONS.values():
@@ -526,6 +576,7 @@ class ProfileManager:
                     "profile_sha1": file_sha1(ini_path) if ini_path.exists() else None,
                     "enabled": True,
                     "autosave_on_manual_close": True,
+                    "save_app_ini": self.get_save_app_ini_globally(),
                     "last_used_at": now_str(),
                     "last_saved_at": None,
                 }
@@ -551,7 +602,15 @@ class ProfileManager:
             self.save_manifest()
             return entry
 
-    def update_entry_options(self, combo_key: str, enabled: bool, autosave: bool, renderer_file: str | None = None, grouping_mode: str | None = None) -> None:
+    def update_entry_options(
+        self,
+        combo_key: str,
+        enabled: bool,
+        autosave: bool,
+        save_app_ini: bool,
+        renderer_file: str | None = None,
+        grouping_mode: str | None = None,
+    ) -> None:
         renderer_file = renderer_file or self.get_selected_renderer()
         grouping_mode = grouping_mode or self.get_selected_grouping()
         entry = self.get_entry(combo_key, renderer_file, grouping_mode)
@@ -559,7 +618,18 @@ class ProfileManager:
             raise KeyError(f"Combo not found: {combo_key}")
         entry["enabled"] = bool(enabled)
         entry["autosave_on_manual_close"] = bool(autosave)
+        entry["save_app_ini"] = bool(save_app_ini)
         self.save_manifest()
+
+    def resolve_entry_for_combo(self, combo: ComboInfo, renderer_file: str | None = None) -> tuple[dict[str, Any] | None, str | None, str | None]:
+        renderer_file = renderer_file or self.get_selected_renderer()
+        combo = combo.normalized()
+        for grouping_mode in self.get_grouping_priority():
+            combo_key = combo.combo_key(grouping_mode)
+            entry = self.get_entry(combo_key, renderer_file, grouping_mode)
+            if entry:
+                return entry, grouping_mode, combo_key
+        return None, None, None
 
     def save_active_ini_as_profile(self, combo: ComboInfo, renderer_file: str | None = None, grouping_mode: str | None = None) -> dict[str, Any]:
         renderer_file = renderer_file or self.get_selected_renderer()
@@ -845,10 +915,12 @@ class MonitorService:
         manager: ProfileManager,
         log_func,
         on_session_closed: Callable[[], None] | None = None,
+        prompt_save_decision: Callable[[ComboInfo, str], bool] | None = None,
     ) -> None:
         self.manager = manager
         self.log_func = log_func
         self.on_session_closed = on_session_closed
+        self.prompt_save_decision = prompt_save_decision
         self.runtime = IRacingRuntime()
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
@@ -893,29 +965,35 @@ class MonitorService:
             if sim_running and connected:
                 combo = self.runtime.detect_combo()
                 if combo is not None:
-                    entry = self.manager.register_combo(combo, renderer_file, grouping_mode)
-                    combo_key = combo.combo_key(grouping_mode)
+                    resolved_entry, resolved_grouping, resolved_key = self.manager.resolve_entry_for_combo(combo, renderer_file)
+                    if resolved_entry is None:
+                        resolved_grouping = grouping_mode
+                        resolved_key = combo.combo_key(resolved_grouping)
+                        resolved_entry = self.manager.register_combo(combo, renderer_file, resolved_grouping)
+                    assert resolved_grouping is not None
+                    assert resolved_key is not None
 
-                    if self.session is None or self.session.get("combo_key") != combo_key or self.session.get("renderer_file") != renderer_file or self.session.get("grouping_mode") != grouping_mode:
+                    if self.session is None or self.session.get("combo_key") != resolved_key or self.session.get("renderer_file") != renderer_file or self.session.get("grouping_mode") != resolved_grouping:
                         self.session = {
-                            "combo_key": combo_key,
+                            "combo_key": resolved_key,
                             "combo": combo,
                             "renderer_file": renderer_file,
-                            "grouping_mode": grouping_mode,
+                            "grouping_mode": resolved_grouping,
                             "close_scheduled_at": None,
                             "wm_close_sent": False,
                             "profile_apply_pending": False,
+                            "is_new_combo": not Path(str(resolved_entry.get("profile_ini") or "")).exists(),
                         }
                         self.log(
                             f"Combo detected: {combo.label()} | "
-                            f"renderer in app: {renderer_file} | grouping: {grouping_mode}"
+                            f"renderer in app: {renderer_file} | resolved grouping: {resolved_grouping}"
                         )
 
-                        profile_exists = Path(str(entry.get("profile_ini") or "")).exists()
-                        enabled = bool(entry.get("enabled", True))
+                        profile_exists = Path(str(resolved_entry.get("profile_ini") or "")).exists()
+                        enabled = bool(resolved_entry.get("enabled", True))
 
                         if profile_exists and enabled:
-                            renderer_matches = self.manager.active_ini_matches_profile(combo_key, renderer_file, grouping_mode)
+                            renderer_matches = self.manager.active_ini_matches_profile(resolved_key, renderer_file, resolved_grouping)
                             has_app_profile = self.manager.has_app_ini_profile_for_car(combo)
                             app_matches = self.manager.active_app_ini_matches_car_profile(combo) if has_app_profile else True
 
@@ -934,7 +1012,7 @@ class MonitorService:
                                     f"WM_CLOSE scheduled for {PRE_CLOSE_DELAY:.0f}s"
                                 )
                         else:
-                            self.log("First time for this grouping, or the profile is disabled. No automatic close will be performed")
+                            self.log("No active saved profile for this combo yet, or it is disabled. Automatic close will not run")
 
                     if self.session is not None:
                         close_due = self.session.get("close_scheduled_at")
@@ -993,29 +1071,42 @@ class MonitorService:
                             self.log("Correct profile applied to the active INI. Reopen the sim manually whenever you want")
                         except Exception as e:
                             self.log(f"Error applying known profile: {e}")
-                        try:
-                            app_path = self.manager.apply_app_ini_profile_for_car(combo)
-                            self.log(f"Per-car app.ini applied: {app_path.name}")
-                        except FileNotFoundError:
-                            self.log("No saved per-car app.ini found yet; skipping app.ini apply")
-                        except Exception as e:
-                            self.log(f"Error applying per-car app.ini: {e}")
+                        session_entry = self.manager.get_entry(session_combo_key, session_renderer, session_grouping)
+                        should_apply_app = self.manager.get_save_app_ini_globally() if session_entry is None else bool(session_entry.get("save_app_ini", self.manager.get_save_app_ini_globally()))
+                        if should_apply_app:
+                            try:
+                                app_path = self.manager.apply_app_ini_profile_for_car(combo)
+                                self.log(f"Per-car app.ini applied: {app_path.name}")
+                            except FileNotFoundError:
+                                self.log("No saved per-car app.ini found yet; skipping app.ini apply")
+                            except Exception as e:
+                                self.log(f"Error applying per-car app.ini: {e}")
+                        else:
+                            self.log("Per-combo app.ini apply is disabled; skipped")
                     else:
                         entry = self.manager.get_entry(session_combo_key, session_renderer, session_grouping)
                         autosave = True if entry is None else bool(entry.get("autosave_on_manual_close", True))
+                        save_app_ini = self.manager.get_save_app_ini_globally() if entry is None else bool(entry.get("save_app_ini", self.manager.get_save_app_ini_globally()))
+                        is_new_combo = bool(self.session.get("is_new_combo", False))
+                        if is_new_combo and self.manager.get_prompt_before_saving_new_combo() and self.prompt_save_decision is not None:
+                            prompt_label = f"{combo.label()} [{session_grouping}]"
+                            autosave = self.prompt_save_decision(combo, prompt_label)
                         if autosave:
                             try:
                                 self.manager.save_active_ini_as_profile(combo, session_renderer, session_grouping)
                                 self.log("Manual close detected, profile saved/updated")
                             except Exception as e:
                                 self.log(f"Error saving profile on manual close: {e}")
-                            try:
-                                app_path = self.manager.save_active_app_ini_for_car(combo)
-                                self.log(f"Per-car app.ini saved/updated: {app_path.name}")
-                            except FileNotFoundError:
-                                self.log("app.ini was not found; per-car app.ini was not saved")
-                            except Exception as e:
-                                self.log(f"Error saving per-car app.ini: {e}")
+                            if save_app_ini:
+                                try:
+                                    app_path = self.manager.save_active_app_ini_for_car(combo)
+                                    self.log(f"Per-car app.ini saved/updated: {app_path.name}")
+                                except FileNotFoundError:
+                                    self.log("app.ini was not found; per-car app.ini was not saved")
+                                except Exception as e:
+                                    self.log(f"Error saving per-car app.ini: {e}")
+                            else:
+                                self.log("Per-combo app.ini save is disabled; skipped")
                         else:
                             self.log("Autosave is disabled for this combo; the profile was not updated")
 
@@ -1087,6 +1178,8 @@ class App(QMainWindow):
         self.log_queue: list[str] = []
         self.log_lock = threading.Lock()
         self.refresh_requested = threading.Event()
+        self.prompt_requests: list[dict[str, Any]] = []
+        self.prompt_lock = threading.Lock()
 
         self.selected_combo_key: str | None = None
 
@@ -1097,6 +1190,7 @@ class App(QMainWindow):
             self.manager,
             self.enqueue_log,
             on_session_closed=self.request_refresh_after_sim_close,
+            prompt_save_decision=self.prompt_save_for_new_combo,
         )
         self.monitor.start()
 
@@ -1182,21 +1276,55 @@ class App(QMainWindow):
     def request_refresh_after_sim_close(self) -> None:
         self.refresh_requested.set()
 
+    def prompt_save_for_new_combo(self, combo: ComboInfo, resolved_label: str) -> bool:
+        event = threading.Event()
+        req = {
+            "event": event,
+            "combo": combo,
+            "resolved_label": resolved_label,
+            "response": False,
+        }
+        with self.prompt_lock:
+            self.prompt_requests.append(req)
+        event.wait(timeout=120.0)
+        return bool(req["response"])
+
     def _drain_log_queue(self) -> None:
         with self.log_lock:
             items = self.log_queue[:]
             self.log_queue.clear()
 
         if not items:
-            return
-
-        self.log_text.moveCursor(QTextCursor.MoveOperation.End)
-        for item in items:
-            self.log_text.append(item)
+            self._process_prompt_requests()
+        else:
+            self.log_text.moveCursor(QTextCursor.MoveOperation.End)
+            for item in items:
+                self.log_text.append(item)
+            self._process_prompt_requests()
 
         if self.refresh_requested.is_set():
             self.refresh_requested.clear()
             self.refresh_all()
+
+    def _process_prompt_requests(self) -> None:
+        with self.prompt_lock:
+            requests = self.prompt_requests[:]
+            self.prompt_requests.clear()
+        for req in requests:
+            combo = req["combo"]
+            resolved_label = req["resolved_label"]
+            answer = QMessageBox.question(
+                self,
+                "New combo detected",
+                "No saved profile was found for this combo.\n\n"
+                f"{combo.label()}\n"
+                f"Resolved grouping: {resolved_label}\n\n"
+                "Save a new profile when this session closes?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            req["response"] = answer == QMessageBox.StandardButton.Yes
+            req["event"].set()
 
     def renderer_to_label(self, renderer_file: str) -> str:
         for label, file_name in RENDERER_OPTIONS.items():
@@ -1221,6 +1349,9 @@ class App(QMainWindow):
 
     def current_grouping_mode(self) -> str:
         return self.label_to_grouping(self.grouping_combo.currentText())
+
+    def selected_save_grouping_mode(self) -> str:
+        return self.label_to_grouping(self.save_grouping_combo.currentText())
 
     def _run_first_time_setup_if_needed(self) -> None:
         if not self.manager.needs_initial_setup():
@@ -1282,6 +1413,19 @@ class App(QMainWindow):
         row0.addStretch(1)
 
         top_layout.addLayout(row0)
+        row1 = QHBoxLayout()
+        self.prompt_on_new_combo_check = QCheckBox("Prompt before saving new combos")
+        self.prompt_on_new_combo_check.setChecked(self.manager.get_prompt_before_saving_new_combo())
+        self.prompt_on_new_combo_check.stateChanged.connect(self.on_global_options_changed)
+        row1.addWidget(self.prompt_on_new_combo_check)
+
+        self.global_save_app_ini_check = QCheckBox("Save app.ini globally by default")
+        self.global_save_app_ini_check.setChecked(self.manager.get_save_app_ini_globally())
+        self.global_save_app_ini_check.stateChanged.connect(self.on_global_options_changed)
+        row1.addWidget(self.global_save_app_ini_check)
+        row1.addStretch(1)
+        top_layout.addLayout(row1)
+
         self.paths_label = QLabel()
         self.paths_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         top_layout.addWidget(self.paths_label)
@@ -1291,9 +1435,9 @@ class App(QMainWindow):
 
         left_box = QGroupBox("Known combos for selected renderer + grouping")
         left_layout = QVBoxLayout(left_box)
-        self.table = QTableWidget(0, 8)
+        self.table = QTableWidget(0, 9)
         self.table.setHorizontalHeaderLabels([
-            "Combo key", "Track", "Layout", "Car", "SeriesID", "Enabled", "Autosave", "Last saved"
+            "Combo key", "Track", "Layout", "Car", "SeriesID", "Enabled", "Autosave", "Save app.ini", "Last saved"
         ])
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
@@ -1323,24 +1467,36 @@ class App(QMainWindow):
         self.enabled_check.setChecked(True)
         self.autosave_check = QCheckBox("Autosave on manual close")
         self.autosave_check.setChecked(True)
+        self.save_app_ini_check = QCheckBox("Save/apply app.ini for this combo")
+        self.save_app_ini_check.setChecked(self.manager.get_save_app_ini_globally())
         opt_row.addWidget(self.enabled_check)
         opt_row.addWidget(self.autosave_check)
+        opt_row.addWidget(self.save_app_ini_check)
         opt_row.addStretch(1)
         right_layout.addLayout(opt_row)
 
+        save_mode_row = QHBoxLayout()
+        save_mode_row.addWidget(QLabel("Save this combo as grouping"))
+        self.save_grouping_combo = QComboBox()
+        self.save_grouping_combo.addItems(list(GROUPING_OPTIONS.keys()))
+        self.save_grouping_combo.setCurrentText(self.grouping_to_label(self.manager.get_selected_grouping()))
+        save_mode_row.addWidget(self.save_grouping_combo)
+        save_mode_row.addStretch(1)
+        right_layout.addLayout(save_mode_row)
+
         btn_grid = QGridLayout()
         buttons = [
-            ("Clear fields", self.clear_fields),
-            ("Refresh list", self.refresh_all),
-            ("Load current sim combo", self.load_current_sim_combo),
-            ("Save/overwrite profile from selected renderer INI", self.save_profile_from_active_ini),
-            ("Apply selected profile to selected renderer INI", self.apply_selected_profile),
-            ("Save enabled/autosave flags", self.save_entry_options),
-            ("Create/refresh global backup", self.create_global_backup),
-            ("Restore global backup to selected renderer INI", self.restore_global_backup),
-            ("Open current profiles folder", self.open_profiles_folder),
-            ("Delete selected profile", self.delete_selected_profile),
-            ("Delete ALL profiles", self.delete_all_profiles),
+            ("Load sim combo", self.load_current_sim_combo),
+            ("Save profile", self.save_profile_from_active_ini),
+            ("Apply profile", self.apply_selected_profile),
+            ("Save combo options", self.save_entry_options),
+            ("Refresh", self.refresh_all),
+            ("Clear", self.clear_fields),
+            ("Backup renderer", self.create_global_backup),
+            ("Restore backup", self.restore_global_backup),
+            ("Open profiles folder", self.open_profiles_folder),
+            ("Delete selected", self.delete_selected_profile),
+            ("Delete all", self.delete_all_profiles),
         ]
         for idx, (label, cb) in enumerate(buttons):
             r, c = divmod(idx, 3)
@@ -1426,18 +1582,26 @@ class App(QMainWindow):
             series_id = str(entry.get("series_id") or "")
             enabled = "yes" if bool(entry.get("enabled", True)) else "no"
             autosave = "yes" if bool(entry.get("autosave_on_manual_close", True)) else "no"
+            save_app_ini = "yes" if bool(entry.get("save_app_ini", self.manager.get_save_app_ini_globally())) else "no"
             saved = str(entry.get("last_saved_at") or "")
 
-            for col, value in enumerate([combo_key, track, layout, car, series_id, enabled, autosave, saved]):
+            for col, value in enumerate([combo_key, track, layout, car, series_id, enabled, autosave, save_app_ini, saved]):
                 self.table.setItem(row, col, QTableWidgetItem(value))
 
         self.table.resizeColumnsToContents()
 
     def refresh_all(self) -> None:
         self.manager.settings = self.manager.load_settings()
+        self.manager.ensure_default_settings()
         self.manager.manifest = self.manager.load_manifest()
         self.manager.ensure_renderer_section(self.current_renderer_file())
         self.manager.ensure_grouping_section(self.current_renderer_file(), self.current_grouping_mode())
+        self.prompt_on_new_combo_check.blockSignals(True)
+        self.global_save_app_ini_check.blockSignals(True)
+        self.prompt_on_new_combo_check.setChecked(self.manager.get_prompt_before_saving_new_combo())
+        self.global_save_app_ini_check.setChecked(self.manager.get_save_app_ini_globally())
+        self.prompt_on_new_combo_check.blockSignals(False)
+        self.global_save_app_ini_check.blockSignals(False)
         self.update_labels()
         self.refresh_table()
         self.refresh_suggestions()
@@ -1462,7 +1626,13 @@ class App(QMainWindow):
         else:
             box.setEditText(text)
 
-    def fill_form(self, combo: ComboInfo, enabled: bool | None = None, autosave: bool | None = None) -> None:
+    def fill_form(
+        self,
+        combo: ComboInfo,
+        enabled: bool | None = None,
+        autosave: bool | None = None,
+        save_app_ini: bool | None = None,
+    ) -> None:
         self._set_combo_text(self.track_internal_edit, combo.track_internal)
         self._set_combo_text(self.track_config_edit, combo.track_config)
         self._set_combo_text(self.track_display_edit, combo.track_display)
@@ -1475,10 +1645,12 @@ class App(QMainWindow):
             self.enabled_check.setChecked(enabled)
         if autosave is not None:
             self.autosave_check.setChecked(autosave)
+        if save_app_ini is not None:
+            self.save_app_ini_check.setChecked(save_app_ini)
 
     def clear_fields(self) -> None:
         self.selected_combo_key = None
-        self.fill_form(ComboInfo(), enabled=True, autosave=True)
+        self.fill_form(ComboInfo(), enabled=True, autosave=True, save_app_ini=self.manager.get_save_app_ini_globally())
         self.set_status("Fields cleared")
 
     def on_renderer_changed(self) -> None:
@@ -1491,9 +1663,15 @@ class App(QMainWindow):
     def on_grouping_changed(self) -> None:
         grouping_mode = self.current_grouping_mode()
         self.manager.set_selected_grouping(grouping_mode)
+        self.save_grouping_combo.setCurrentText(self.grouping_to_label(grouping_mode))
         self.selected_combo_key = None
         self.refresh_all()
         self.set_status(f"Default grouping changed to {grouping_mode}")
+
+    def on_global_options_changed(self) -> None:
+        self.manager.set_prompt_before_saving_new_combo(self.prompt_on_new_combo_check.isChecked())
+        self.manager.set_save_app_ini_globally(self.global_save_app_ini_check.isChecked())
+        self.set_status("Global safeguards updated")
 
     def on_table_select(self) -> None:
         row = self.table.currentRow()
@@ -1512,8 +1690,10 @@ class App(QMainWindow):
             combo,
             enabled=bool(entry.get("enabled", True)),
             autosave=bool(entry.get("autosave_on_manual_close", True)),
+            save_app_ini=bool(entry.get("save_app_ini", self.manager.get_save_app_ini_globally())),
         )
         self.selected_combo_key = combo_key
+        self.save_grouping_combo.setCurrentText(self.grouping_to_label(str(entry.get("grouping_mode") or self.current_grouping_mode())))
         self.set_status(f"Selected combo: {combo.label()}")
 
     def load_current_sim_combo(self) -> None:
@@ -1530,13 +1710,19 @@ class App(QMainWindow):
             if combo is None:
                 QMessageBox.information(self, "Info", "Could not detect a complete combo right now.")
                 return
-            entry = self.manager.register_combo(combo, self.current_renderer_file(), self.current_grouping_mode())
+            entry, grouping_mode, combo_key = self.manager.resolve_entry_for_combo(combo, self.current_renderer_file())
+            if entry is None or grouping_mode is None or combo_key is None:
+                grouping_mode = self.selected_save_grouping_mode()
+                entry = self.manager.register_combo(combo, self.current_renderer_file(), grouping_mode)
+                combo_key = combo.combo_key(grouping_mode)
             self.fill_form(
                 combo,
                 enabled=bool(entry.get("enabled", True)),
                 autosave=bool(entry.get("autosave_on_manual_close", True)),
+                save_app_ini=bool(entry.get("save_app_ini", self.manager.get_save_app_ini_globally())),
             )
-            self.selected_combo_key = combo.combo_key(self.current_grouping_mode())
+            self.save_grouping_combo.setCurrentText(self.grouping_to_label(grouping_mode))
+            self.selected_combo_key = combo_key
             self.refresh_all()
             self.set_status(f"Combo loaded from the sim: {combo.label()}")
         finally:
@@ -1549,22 +1735,25 @@ class App(QMainWindow):
             return
 
         try:
-            entry = self.manager.save_active_ini_as_profile(combo, self.current_renderer_file(), self.current_grouping_mode())
+            target_grouping = self.selected_save_grouping_mode()
+            entry = self.manager.save_active_ini_as_profile(combo, self.current_renderer_file(), target_grouping)
             app_saved = False
-            try:
-                self.manager.save_active_app_ini_for_car(combo)
-                app_saved = True
-            except FileNotFoundError:
-                self.log("app.ini was not found; per-car app.ini was not saved")
-            except Exception as e:
-                self.log(f"Error saving per-car app.ini: {e}")
-            combo_key = combo.combo_key(self.current_grouping_mode())
+            if self.save_app_ini_check.isChecked():
+                try:
+                    self.manager.save_active_app_ini_for_car(combo)
+                    app_saved = True
+                except FileNotFoundError:
+                    self.log("app.ini was not found; per-car app.ini was not saved")
+                except Exception as e:
+                    self.log(f"Error saving per-car app.ini: {e}")
+            combo_key = combo.combo_key(target_grouping)
             self.manager.update_entry_options(
                 combo_key,
                 self.enabled_check.isChecked(),
                 self.autosave_check.isChecked(),
+                self.save_app_ini_check.isChecked(),
                 self.current_renderer_file(),
-                self.current_grouping_mode(),
+                target_grouping,
             )
             self.selected_combo_key = combo_key
             self.refresh_all()
@@ -1621,14 +1810,21 @@ class App(QMainWindow):
             runtime.reset()
 
         try:
+            entry, grouping_mode, combo_key = self.manager.resolve_entry_for_combo(combo, self.current_renderer_file())
+            if entry is None or grouping_mode is None or combo_key is None:
+                QMessageBox.critical(self, "Error", "No saved profile found for this combo in any grouping.")
+                return
             self.manager.apply_profile_to_active_ini(
-                combo.combo_key(self.current_grouping_mode()),
+                combo_key,
                 self.current_renderer_file(),
-                self.current_grouping_mode(),
+                grouping_mode,
             )
             try:
-                self.manager.apply_app_ini_profile_for_car(combo)
-                self.set_status(f"Profile + per-car app.ini applied ({self.current_renderer_file()})")
+                if bool(entry.get("save_app_ini", self.manager.get_save_app_ini_globally())):
+                    self.manager.apply_app_ini_profile_for_car(combo)
+                    self.set_status(f"Profile + per-car app.ini applied ({self.current_renderer_file()})")
+                else:
+                    self.set_status(f"Profile applied ({self.current_renderer_file()}); app.ini apply disabled for this combo")
             except FileNotFoundError:
                 self.set_status(f"Profile applied ({self.current_renderer_file()}); no per-car app.ini saved for this car yet")
             except Exception as e:
@@ -1644,17 +1840,19 @@ class App(QMainWindow):
             return
 
         try:
-            self.manager.register_combo(combo, self.current_renderer_file(), self.current_grouping_mode())
+            target_grouping = self.selected_save_grouping_mode()
+            self.manager.register_combo(combo, self.current_renderer_file(), target_grouping)
             self.manager.update_entry_options(
-                combo.combo_key(self.current_grouping_mode()),
+                combo.combo_key(target_grouping),
                 self.enabled_check.isChecked(),
                 self.autosave_check.isChecked(),
+                self.save_app_ini_check.isChecked(),
                 self.current_renderer_file(),
-                self.current_grouping_mode(),
+                target_grouping,
             )
-            self.selected_combo_key = combo.combo_key(self.current_grouping_mode())
+            self.selected_combo_key = combo.combo_key(target_grouping)
             self.refresh_all()
-            self.set_status("Enabled/autosave flags saved")
+            self.set_status("Combo options saved")
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
 
