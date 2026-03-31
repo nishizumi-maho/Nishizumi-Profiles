@@ -1,4 +1,4 @@
-# Nishizumi_Profiles (v1.0.0)
+# Nishizumi_Profiles
 
 Nishizumi_Profiles is a desktop app for iRacing that automatically manages graphics renderer profiles based on your combo (car, track, or series grouping).
 
