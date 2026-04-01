@@ -7,8 +7,6 @@ import os
 import shutil
 import threading
 import time
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -75,15 +73,8 @@ POST_CLOSE_SETTLE_TIMEOUT = 25.0
 FILE_STABLE_SECONDS = 2.0
 LOG_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
 APP_NAME = "Nishizumi_Profiles"
-APP_VERSION = "5.0.0"
+APP_VERSION = "1.0.0"
 PROFILE_PRIORITY_ORDER = ["car_track", "car", "track", "series_track", "series"]
-
-GITHUB_RELEASE_OWNER = "nishizumi-maho"
-GITHUB_RELEASE_REPO = "Nishizumi-Profiles"
-GITHUB_RELEASES_API_LATEST = f"https://api.github.com/repos/{GITHUB_RELEASE_OWNER}/{GITHUB_RELEASE_REPO}/releases/latest"
-GITHUB_RELEASES_PAGE_LATEST = f"https://github.com/{GITHUB_RELEASE_OWNER}/{GITHUB_RELEASE_REPO}/releases/latest"
-GITHUB_API_VERSION = "2022-11-28"
-GITHUB_UPDATE_CHECK_INTERVAL_SECONDS = 6 * 60 * 60
 
 
 # ============================================================
@@ -128,41 +119,6 @@ def files_equal(a: Path, b: Path) -> bool:
         return a.read_bytes() == b.read_bytes()
     except Exception:
         return False
-
-
-def _normalize_version(version: str) -> tuple[int, ...]:
-    cleaned = version.strip().lower().lstrip("v")
-    tokens = [part for part in cleaned.replace("-", ".").split(".") if part]
-    values: list[int] = []
-    for token in tokens:
-        digits = "".join(ch for ch in token if ch.isdigit())
-        if digits:
-            values.append(int(digits))
-    return tuple(values) if values else (0,)
-
-
-def is_version_newer(candidate: str, current: str) -> bool:
-    return _normalize_version(candidate) > _normalize_version(current)
-
-
-def fetch_latest_github_release() -> tuple[str, str] | None:
-    request = urllib.request.Request(
-        GITHUB_RELEASES_API_LATEST,
-        headers={
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": GITHUB_API_VERSION,
-            "User-Agent": f"{APP_NAME}/{APP_VERSION}",
-        },
-    )
-    with urllib.request.urlopen(request, timeout=10) as response:
-        raw = response.read().decode("utf-8", errors="replace")
-    payload = json.loads(raw)
-    tag = str(payload.get("tag_name") or "").strip()
-    name = str(payload.get("name") or "").strip()
-    latest_version = tag or name
-    if not latest_version:
-        return None
-    return latest_version, GITHUB_RELEASES_PAGE_LATEST
 
 
 def safe_get(ir: irsdk.IRSDK, key: str):
@@ -1194,7 +1150,6 @@ class App(QMainWindow):
         self.refresh_requested = threading.Event()
         self.prompt_lock = threading.Lock()
         self.pending_prompt: dict[str, Any] | None = None
-        self.update_check_started = False
 
         self.selected_combo_key: str | None = None
 
@@ -1215,12 +1170,6 @@ class App(QMainWindow):
         self.log_timer.setInterval(200)
         self.log_timer.timeout.connect(self._drain_log_queue)
         self.log_timer.start()
-
-        self.update_timer = QTimer(self)
-        self.update_timer.setInterval(GITHUB_UPDATE_CHECK_INTERVAL_SECONDS * 1000)
-        self.update_timer.timeout.connect(self.check_for_updates)
-        self.update_timer.start()
-        self.check_for_updates()
 
     def _load_bootstrap_path(self) -> Path | None:
         if not BOOTSTRAP_SETTINGS_PATH.exists():
@@ -1312,33 +1261,6 @@ class App(QMainWindow):
         if self.refresh_requested.is_set():
             self.refresh_requested.clear()
             self.refresh_all()
-
-    def check_for_updates(self) -> None:
-        if not self.update_check_started:
-            self.update_check_started = True
-            self.enqueue_log(f"[{now_str()}] Checking GitHub releases for updates...")
-        try:
-            result = fetch_latest_github_release()
-            if result is None:
-                self.enqueue_log(f"[{now_str()}] Update check: latest release data is empty")
-                return
-
-            latest_version, release_url = result
-            if is_version_newer(latest_version, APP_VERSION):
-                self.enqueue_log(
-                    f"[{now_str()}] Update available: {latest_version} "
-                    f"(current: v{APP_VERSION}) | {release_url}"
-                )
-            else:
-                self.enqueue_log(
-                    f"[{now_str()}] Update check: you are on the latest version (v{APP_VERSION})"
-                )
-        except urllib.error.HTTPError as e:
-            self.enqueue_log(f"[{now_str()}] Update check failed (HTTP {e.code})")
-        except urllib.error.URLError as e:
-            self.enqueue_log(f"[{now_str()}] Update check failed ({e.reason})")
-        except Exception as e:
-            self.enqueue_log(f"[{now_str()}] Update check failed ({e})")
 
     def confirm_new_combo_save(self, combo: ComboInfo) -> bool:
         request = {
