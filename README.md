@@ -12,7 +12,6 @@ It helps you avoid manually editing `rendererDX11*.ini` every time you switch co
 - Saves per-combo renderer INI profiles.
 - Applies the correct profile to your active renderer INI.
 - Supports **Monitor**, **OpenXR**, and **OpenVR** renderer files.
-- Checks GitHub Releases periodically to notify when a newer app version is available.
 - Lets you organize profiles by:
   - Car + track
   - Car only
@@ -149,11 +148,5 @@ A bootstrap path file is also saved in your home directory so the app remembers 
 
 ## Version
 
-Current release documented here: **v5.0.0**
+Current release documented here: **1.0.0**
 
-GitHub release update check is configured for:
-
-- Owner: `nishizumi-maho`
-- Repository: `Nishizumi-Profiles`
-- Endpoint: `https://api.github.com/repos/nishizumi-maho/Nishizumi-Profiles/releases/latest`
-- Check interval: every 6 hours
